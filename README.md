@@ -1,81 +1,83 @@
 # VideoRead
 
-VideoRead 是一个用于批量审阅视频的多窗口平铺播放器。
+[![English](https://img.shields.io/badge/README-English-2d6cdf?style=for-the-badge)](README.md) [![简体中文](https://img.shields.io/badge/%E8%AF%B4%E6%98%8E-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-2d6cdf?style=for-the-badge)](README.zh-CN.md)
 
-它适合这些场景：
-- 同时查看多个短视频或片段
-- 横屏与竖屏视频混合对比
-- 保持顺序、比例与尽量高的屏幕利用率
-- 用模板保存常用视频组合并重复打开
-- 其实最大的作用是方便你用你巨大的屏幕，自动平铺各种你精选的小视频即刻起飞
+VideoRead is a multi-window tiled video player for reviewing many clips at once.
 
-## 本版本主要功能
-- 多窗口组同时打开视频
-- 默认静音循环播放
-- 支持拖拽导入视频
-- 固定行数排版与智能排版
-- 组内拖动调整视频顺序
-- 单视频悬浮控制：播放/暂停、静音、进度、音量
-- 模板库、历史记录、会话保存
-- 模板打开、更新、重新加载、删除
-- 批量移除视频
+It works especially well when you want to:
+- compare multiple short videos or clips side by side
+- mix horizontal and vertical videos in the same workspace
+- preserve order, aspect ratio, and make good use of screen space
+- save reusable video sets as templates
+- and, honestly, use your giant screen to tile your hand-picked clips so you can get going right away
 
-## 下载与使用
-仓库内已附带可直接运行的发布版：
+## Features
+- Multiple video window groups at the same time
+- Silent looping playback by default
+- Drag and drop video import
+- Fixed-row layout and smart layout
+- Drag to reorder videos inside a group
+- Per-video hover controls: play/pause, mute, progress, volume
+- Template library, history, and session saving
+- Open, update, reload, and delete templates
+- Batch remove videos
+
+## Download and Use
+A ready-to-run build is included in this repository:
 - `dist/VideoRead.exe`
 
-使用说明：
-- 直接运行 EXE 不需要提前安装 Python
-- 首次运行时，程序会在 `dist/state/` 下自动生成自己的本地状态目录
-- 建议把整个 `dist` 目录一起保存和移动
+Usage notes:
+- Running the EXE does not require Python to be installed.
+- On first launch, the app creates its own local state folder under `dist/state/`.
+- It is best to keep and move the whole `dist` folder together.
 
-播放说明：
-- 常见 `mp4`、`mkv`、`webm`、`mov`、`avi` 文件可直接尝试播放
-- 如果个别视频格式无法播放，优先尝试 `H.264 + AAC` 的 `mp4` 文件
-- 视频播放能力最终也会受到系统多媒体环境和文件编码方式影响
+Playback notes:
+- Common `mp4`, `mkv`, `webm`, `mov`, and `avi` files should work in most cases.
+- If some files do not play correctly, `mp4` files encoded with `H.264 + AAC` are usually the safest choice.
+- Playback behavior can still depend on the system multimedia environment and the actual codec used by the file.
 
-## 从源码运行
-环境要求：
+## Run from Source
+Environment:
 - Windows 10/11
-- Python 3.12 或相近版本
+- Python 3.12 or a nearby version
 
-安装依赖：
+Install dependencies:
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-启动：
+Run:
 ```powershell
 python app.py
 ```
 
-也可以双击：
+Or double-click:
 - `start_videoread.bat`
 
-## 基本使用
-1. 启动程序后创建窗口组。
-2. 拖拽视频到窗口组中，或使用界面按钮导入。
-3. 根据需要切换固定排版或智能排版。
-4. 鼠标移到单个视频上，会显示简洁悬浮控制条。
-5. 在窗口组中拖动视频即可调整顺序。
-6. 可保存为模板，下次直接打开常用视频组。
+## Basic Usage
+1. Start the app and create a window group.
+2. Drag videos into the group, or import them through the UI.
+3. Switch between fixed layout and smart layout as needed.
+4. Hover over a video to show the minimal overlay controls.
+5. Drag videos inside a group to reorder them.
+6. Save a template if you want to reopen the same set later.
 
-## 模板与历史
-- 模板：适合保存常用视频组合、顺序、算法与排版设置。
-- 历史：适合恢复最近的查看状态。
-- 这些内容默认写到本地 `state/` 目录，不会改动原始视频文件。
+## Templates and History
+- Templates are useful for saving common video sets, order, algorithm choice, and layout settings.
+- History is useful for restoring recent working states.
+- These are stored locally in the `state/` folder and do not modify the original files.
 
-## 算法说明
-本仓库附带了独立的排版算法说明文档：
+## Layout Algorithm Notes
+This repository includes a separate layout algorithm document:
 - `docs/layout_algorithms.md`
 
-里面说明了当前主要排版算法的设计目标、核心思路和关键代码片段，方便继续迭代和交流。
+It explains the current layout strategies, their goals, and the core implementation ideas with code snippets.
 
-## 想请教和征集建议
-目前智能排版已经能满足日常使用，但我相信还有继续优化的空间，尤其是在：
-- 横屏与竖屏混排时的空间利用率
-- 多视频同时播放时的布局稳定性
-- 不同窗口尺寸下的排版自然度
-- 更多视频数量下的显示效率与可读性
+## Feedback and Algorithm Improvements
+The current smart layout is already practical for daily use, but there is still room for improvement, especially around:
+- space utilization for mixed horizontal and vertical videos
+- stability when many videos are playing at once
+- more natural layouts under very different window sizes
+- better readability and density for larger batches
 
-如果有大佬愿意帮忙一起看看、更进一步优化算法，非常欢迎交流和建议。
+If anyone would like to help improve the layout algorithms even further, suggestions and contributions are very welcome.

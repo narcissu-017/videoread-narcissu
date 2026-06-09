@@ -4,6 +4,8 @@
 
 VideoRead is a multi-window tiled video player for reviewing many clips at once.
 
+Current version: `v0.9`
+
 It works especially well when you want to:
 - compare multiple short videos or clips side by side
 - mix horizontal and vertical videos in the same workspace
@@ -21,6 +23,17 @@ It works especially well when you want to:
 - Template library, history, and session saving
 - Open, update, reload, and delete templates
 - Batch remove videos
+- System playback mode and optional VLC playback mode
+
+## What's New in v0.9
+Compared with v0.8, this version adds and improves:
+- Optional playback backend selection between system mode and VLC mode
+- Per-video progress control in the hover overlay
+- Restart all videos from the beginning from the window context menu
+- Multi-select, deselect, and batch remove inside a video group
+- Window-level context menu actions for saving, updating, and reloading templates
+- Better mixed horizontal/vertical video layout and cross-DPI screen movement handling
+- Safer cleanup when reloading templates or removing videos
 
 ## Download and Use
 A ready-to-run build is included in this repository:
@@ -34,7 +47,9 @@ Usage notes:
 Playback notes:
 - Common `mp4`, `mkv`, `webm`, `mov`, and `avi` files should work in most cases.
 - If some files do not play correctly, `mp4` files encoded with `H.264 + AAC` are usually the safest choice.
-- Playback behavior can still depend on the system multimedia environment and the actual codec used by the file.
+- System mode uses the local Windows/Qt multimedia environment.
+- VLC mode can be selected in the app when a compatible VLC/libVLC runtime is available.
+- If VLC mode is not available, VideoRead can still be used in system mode.
 
 ## Run from Source
 Environment:
@@ -45,6 +60,10 @@ Install dependencies:
 ```powershell
 python -m pip install -r requirements.txt
 ```
+
+Optional VLC mode:
+- Install VLC on Windows, or place a compatible `libVLC/` or `vlc_runtime/` folder next to `app.py`.
+- The source repository does not include local runtime bundles or personal state data.
 
 Run:
 ```powershell

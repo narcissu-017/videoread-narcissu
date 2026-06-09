@@ -11,7 +11,12 @@ build/
 
 # Runtime / local state
 state/
+dist/state/
 *.log
+
+# Local / optional runtime bundles
+libVLC/
+vlc_runtime/
 
 # IDE / OS
 .vscode/

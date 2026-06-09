@@ -3,21 +3,82 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+if getattr(sys, "frozen", False):
+    _EARLY_APP_DIR = Path(sys.executable).resolve().parent
+    _EARLY_RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", _EARLY_APP_DIR)).resolve()
+else:
+    _EARLY_APP_DIR = Path(__file__).resolve().parent
+    _EARLY_RESOURCE_DIR = _EARLY_APP_DIR
+
+
+def _early_candidate_vlc_dirs() -> list[Path]:
+    candidates = [
+        _EARLY_RESOURCE_DIR / "vlc_runtime",
+        _EARLY_RESOURCE_DIR / "libVLC",
+        _EARLY_APP_DIR / "vlc_runtime",
+        _EARLY_APP_DIR / "libVLC",
+    ]
+    for env_name in ("VIDE0READ_VLC_DIR", "VIDEOREAD_VLC_DIR", "VLC_DIR"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            candidates.append(Path(raw))
+    if sys.platform.startswith("win"):
+        candidates.extend(
+            [
+                Path(r"C:\Program Files\VideoLAN\VLC"),
+                Path(r"C:\Program Files (x86)\VideoLAN\VLC"),
+            ]
+        )
+    seen: set[str] = set()
+    out: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def _preload_vlc_runtime_for_import() -> None:
+    for candidate in _early_candidate_vlc_dirs():
+        if not candidate.exists():
+            continue
+        plugin_dir = candidate / "plugins"
+        if plugin_dir.exists():
+            os.environ.setdefault("VLC_PLUGIN_PATH", str(plugin_dir))
+        if sys.platform.startswith("win"):
+            try:
+                os.add_dll_directory(str(candidate))
+            except Exception:
+                pass
+        break
+
+
+_preload_vlc_runtime_for_import()
 
 try:
     import av
 except Exception:
     av = None
 
-from PyQt5.QtCore import QPoint, QPointF, QRect, QRectF, QTimer, Qt, QUrl, pyqtSignal
-from PyQt5.QtGui import QBrush, QColor, QGuiApplication, QIcon, QPainter, QPalette, QPen, QPolygonF
+try:
+    import vlc
+except Exception:
+    vlc = None
+
+from PyQt5.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QTimer, Qt, QUrl, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QCursor, QGuiApplication, QIcon, QPainter, QPalette, QPen, QPolygonF
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -44,9 +105,24 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer, QMediaPlaylist
 from PyQt5.QtMultimediaWidgets import QVideoWidget
+try:
+    from PyQt5 import sip
+except Exception:
+    sip = None
 
+APP_VERSION = "0.9"
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v", ".ts", ".flv"}
 LAYOUT_ALGOS = {"grid": "算法1", "justified": "算法2"}
+PLAYBACK_BACKENDS = {
+    "qt": "系统模式 (Qt/本机)",
+    "vlc": "独立模式 (VLC)",
+}
+VLC_QUIET_ARGS = (
+    "--quiet",
+    "--verbose=-1",
+    "--no-video-title-show",
+    "--no-stats",
+)
 
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -63,6 +139,10 @@ TEMPLATE_DIR = STATE_DIR / "templates"
 HISTORY_DIR = STATE_DIR / "history"
 SESSION_FILE = STATE_DIR / "session.json"
 _APP_ICON_CACHE: Optional[QIcon] = None
+_VLC_RUNTIME_OK: Optional[bool] = None
+_VLC_RUNTIME_READY = False
+_SHARED_VLC_INSTANCE = None
+_SHARED_VLC_LOG_CALLBACK = None
 
 
 def ensure_dirs() -> None:
@@ -82,6 +162,114 @@ def apply_window_icon(widget: QWidget) -> None:
     icon = load_app_icon()
     if not icon.isNull():
         widget.setWindowIcon(icon)
+
+
+def playback_backend_label(key: str) -> str:
+    return PLAYBACK_BACKENDS.get(key, PLAYBACK_BACKENDS["qt"])
+
+
+def playback_backend_from_label(text: str) -> str:
+    return "vlc" if "VLC" in str(text) else "qt"
+
+
+def _candidate_vlc_runtime_dirs() -> list[Path]:
+    candidates = [
+        RESOURCE_DIR / "vlc_runtime",
+        RESOURCE_DIR / "libVLC",
+        APP_DIR / "vlc_runtime",
+        APP_DIR / "libVLC",
+    ]
+    for env_name in ("VIDE0READ_VLC_DIR", "VIDEOREAD_VLC_DIR", "VLC_DIR"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            candidates.append(Path(raw))
+    if sys.platform.startswith("win"):
+        candidates.extend(
+            [
+                Path(r"C:\Program Files\VideoLAN\VLC"),
+                Path(r"C:\Program Files (x86)\VideoLAN\VLC"),
+            ]
+        )
+    seen: set[str] = set()
+    out: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
+def prepare_vlc_runtime() -> Optional[Path]:
+    global _VLC_RUNTIME_READY
+    if _VLC_RUNTIME_READY:
+        for candidate in _candidate_vlc_runtime_dirs():
+            if candidate.exists():
+                return candidate
+        return None
+    for candidate in _candidate_vlc_runtime_dirs():
+        if not candidate.exists():
+            continue
+        plugin_dir = candidate / "plugins"
+        if plugin_dir.exists():
+            os.environ["VLC_PLUGIN_PATH"] = str(plugin_dir)
+        if sys.platform.startswith("win"):
+            try:
+                os.add_dll_directory(str(candidate))
+            except Exception:
+                pass
+        _VLC_RUNTIME_READY = True
+        return candidate
+    return None
+
+
+def is_vlc_runtime_available() -> bool:
+    global _VLC_RUNTIME_OK
+    if _VLC_RUNTIME_OK is not None:
+        return _VLC_RUNTIME_OK
+    if vlc is None:
+        _VLC_RUNTIME_OK = False
+        return False
+    try:
+        shared_vlc_instance()
+        _VLC_RUNTIME_OK = True
+    except Exception:
+        _VLC_RUNTIME_OK = False
+    return _VLC_RUNTIME_OK
+
+
+def attach_silent_vlc_log(instance) -> Optional[object]:
+    if vlc is None:
+        return None
+    try:
+        callback_type = getattr(vlc, "LogCb", None)
+        if callback_type is None:
+            callback_type = vlc.CallbackDecorators.LogCb
+
+        @callback_type
+        def _silent_log(_data, _level, _ctx, _fmt, _args) -> None:
+            return None
+
+        instance.log_set(_silent_log, None)
+        return _silent_log
+    except Exception:
+        return None
+
+
+def shared_vlc_instance():
+    global _SHARED_VLC_INSTANCE, _SHARED_VLC_LOG_CALLBACK
+    if vlc is None:
+        raise RuntimeError("python-vlc 未安装。")
+    if _SHARED_VLC_INSTANCE is not None:
+        return _SHARED_VLC_INSTANCE
+    prepare_vlc_runtime()
+    instance = vlc.Instance(*VLC_QUIET_ARGS)
+    if instance is None:
+        raise RuntimeError("VLC 初始化失败。")
+    _SHARED_VLC_INSTANCE = instance
+    _SHARED_VLC_LOG_CALLBACK = attach_silent_vlc_log(instance)
+    return _SHARED_VLC_INSTANCE
 
 
 def sanitize_template_name(name: str) -> str:
@@ -171,6 +359,335 @@ class TemplateInfoDialog(QDialog):
 
     def values(self) -> tuple[str, str]:
         return self.name_edit.text().strip(), self.category_edit.text().strip()
+
+
+class MediaBackendBase(QObject):
+    positionChanged = pyqtSignal(int)
+    durationChanged = pyqtSignal(int)
+    errorOccurred = pyqtSignal(str)
+    backend_key = "base"
+
+    def __init__(self, parent: QWidget, path: Path) -> None:
+        super().__init__(parent)
+        self.path = path
+        self.video_widget: QWidget = QWidget(parent)
+
+    def play(self) -> None:
+        raise NotImplementedError
+
+    def pause(self) -> None:
+        raise NotImplementedError
+
+    def stop(self) -> None:
+        raise NotImplementedError
+
+    def set_muted(self, muted: bool) -> None:
+        raise NotImplementedError
+
+    def set_volume(self, volume: int) -> None:
+        raise NotImplementedError
+
+    def set_position(self, position_ms: int) -> None:
+        raise NotImplementedError
+
+    def position(self) -> int:
+        raise NotImplementedError
+
+    def duration(self) -> int:
+        raise NotImplementedError
+
+    def restart_playback(self) -> None:
+        self.set_position(0)
+        self.play()
+
+    def rebind_output(self) -> None:
+        return
+
+
+class QtMediaBackend(MediaBackendBase):
+    backend_key = "qt"
+
+    def __init__(self, parent: QWidget, path: Path) -> None:
+        super().__init__(parent, path)
+        self._closed = False
+        self.video_widget = QVideoWidget(parent)
+        self.video_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.video_widget.setAspectRatioMode(Qt.KeepAspectRatio)
+        self.playlist = QMediaPlaylist(self)
+        self.playlist.addMedia(QMediaContent(QUrl.fromLocalFile(str(path))))
+        self.playlist.setPlaybackMode(QMediaPlaylist.Loop)
+        self.player = QMediaPlayer(self, QMediaPlayer.VideoSurface)
+        self.player.setPlaylist(self.playlist)
+        self.player.setVideoOutput(self.video_widget)
+        self.player.setMuted(True)
+        self.player.setVolume(0)
+        self.player.error.connect(self._on_player_error)
+        self.player.positionChanged.connect(self._on_position_changed)
+        self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.play()
+
+    def _is_closed_or_deleted(self) -> bool:
+        if self._closed:
+            return True
+        if sip is None:
+            return False
+        try:
+            return bool(sip.isdeleted(self))
+        except Exception:
+            return True
+
+    def _on_player_error(self, *_args) -> None:
+        if not self._is_closed_or_deleted():
+            self.errorOccurred.emit("播放失败")
+
+    def _on_position_changed(self, value: int) -> None:
+        if not self._is_closed_or_deleted():
+            self.positionChanged.emit(max(0, int(value)))
+
+    def _on_duration_changed(self, value: int) -> None:
+        if not self._is_closed_or_deleted():
+            self.durationChanged.emit(max(0, int(value)))
+
+    def play(self) -> None:
+        if self._is_closed_or_deleted():
+            return
+        self.player.play()
+
+    def pause(self) -> None:
+        if self._is_closed_or_deleted():
+            return
+        self.player.pause()
+
+    def stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.player.positionChanged.disconnect(self._on_position_changed)
+        except Exception:
+            pass
+        try:
+            self.player.durationChanged.disconnect(self._on_duration_changed)
+        except Exception:
+            pass
+        try:
+            self.player.error.disconnect(self._on_player_error)
+        except Exception:
+            pass
+        try:
+            self.player.stop()
+            self.player.setVideoOutput(None)
+            self.player.setPlaylist(None)
+        except Exception:
+            pass
+
+    def set_muted(self, muted: bool) -> None:
+        if self._is_closed_or_deleted():
+            return
+        self.player.setMuted(bool(muted))
+
+    def set_volume(self, volume: int) -> None:
+        if self._is_closed_or_deleted():
+            return
+        self.player.setVolume(max(0, min(100, int(volume))))
+
+    def set_position(self, position_ms: int) -> None:
+        if self._is_closed_or_deleted():
+            return
+        self.player.setPosition(max(0, int(position_ms)))
+
+    def position(self) -> int:
+        if self._is_closed_or_deleted():
+            return 0
+        return max(0, int(self.player.position()))
+
+    def duration(self) -> int:
+        if self._is_closed_or_deleted():
+            return 0
+        return max(0, int(self.player.duration()))
+
+
+class VlcMediaBackend(MediaBackendBase):
+    backend_key = "vlc"
+    _start_counter = 0
+
+    def __init__(self, parent: QWidget, path: Path) -> None:
+        super().__init__(parent, path)
+        if not is_vlc_runtime_available():
+            raise RuntimeError("VLC 运行库不可用，请安装 VLC 或在发布版中携带 libVLC。")
+        prepare_vlc_runtime()
+        self._closed = False
+        self.video_widget = QWidget(parent)
+        self.video_widget.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.video_widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.video_widget.setAutoFillBackground(True)
+        palette = self.video_widget.palette()
+        palette.setColor(QPalette.Window, QColor("#000000"))
+        self.video_widget.setPalette(palette)
+        self._instance = shared_vlc_instance()
+        self._media = self._instance.media_new(str(path))
+        if self._media is None:
+            raise RuntimeError("VLC 无法创建媒体对象。")
+        try:
+            self._media.add_option("input-repeat=65535")
+        except Exception:
+            pass
+        self._player = self._instance.media_player_new()
+        if self._player is None:
+            raise RuntimeError("VLC 无法创建播放器对象。")
+        self._player.set_media(self._media)
+        self._muted = True
+        self._volume = 0
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_state)
+        self._last_duration = 0
+        self._bound = False
+        VlcMediaBackend._start_counter += 1
+        start_delay = ((VlcMediaBackend._start_counter - 1) % 24) * 120
+        QTimer.singleShot(start_delay, self._start)
+
+    def _start(self) -> None:
+        if self._closed:
+            return
+        self.rebind_output()
+        self.set_muted(True)
+        self.set_volume(0)
+        self.play()
+        self._poll_timer.start(450)
+
+    def _poll_state(self) -> None:
+        if self._closed or self._player is None:
+            return
+        try:
+            duration = max(0, int(self._player.get_length()))
+            position = max(0, int(self._player.get_time()))
+            if duration != self._last_duration:
+                self._last_duration = duration
+                self.durationChanged.emit(duration)
+            self.positionChanged.emit(position)
+            state = self._player.get_state()
+            if state == vlc.State.Ended:
+                self._player.set_time(0)
+                self._player.play()
+            elif state == vlc.State.Error:
+                self.errorOccurred.emit("VLC 播放失败")
+        except Exception as exc:
+            self.errorOccurred.emit(str(exc))
+
+    def _bind_output(self) -> None:
+        if self._closed or self._player is None:
+            return
+        try:
+            wid = int(self.video_widget.winId())
+            if sys.platform.startswith("win"):
+                self._player.set_hwnd(wid)
+            elif sys.platform == "darwin":
+                self._player.set_nsobject(wid)
+            else:
+                self._player.set_xwindow(wid)
+            self._bound = True
+        except Exception as exc:
+            self.errorOccurred.emit(str(exc))
+
+    def play(self) -> None:
+        if self._closed or self._player is None:
+            return
+        self.rebind_output()
+        self._player.play()
+
+    def pause(self) -> None:
+        if self._closed or self._player is None:
+            return
+        self._player.pause()
+
+    def stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._poll_timer.stop()
+        player = self._player
+        media = self._media
+        self._player = None
+        self._media = None
+
+        def _release() -> None:
+            try:
+                if player is not None:
+                    player.stop()
+            except Exception:
+                pass
+            try:
+                if player is not None:
+                    player.release()
+            except Exception:
+                pass
+            try:
+                if media is not None:
+                    media.release()
+            except Exception:
+                pass
+
+        threading.Thread(target=_release, daemon=True).start()
+
+    def set_muted(self, muted: bool) -> None:
+        self._muted = bool(muted)
+        if self._closed or self._player is None:
+            return
+        try:
+            self._player.audio_set_mute(self._muted)
+        except Exception:
+            pass
+
+    def set_volume(self, volume: int) -> None:
+        self._volume = max(0, min(100, int(volume)))
+        if self._closed or self._player is None:
+            return
+        try:
+            self._player.audio_set_volume(0 if self._muted else self._volume)
+        except Exception:
+            pass
+
+    def set_position(self, position_ms: int) -> None:
+        if self._closed or self._player is None:
+            return
+        try:
+            self._player.set_time(max(0, int(position_ms)))
+        except Exception:
+            pass
+
+    def position(self) -> int:
+        if self._closed or self._player is None:
+            return 0
+        try:
+            return max(0, int(self._player.get_time()))
+        except Exception:
+            return 0
+
+    def duration(self) -> int:
+        if self._closed or self._player is None:
+            return 0
+        try:
+            return max(0, int(self._player.get_length()))
+        except Exception:
+            return 0
+
+    def rebind_output(self) -> None:
+        if self._closed:
+            return
+        if not self.video_widget.isVisible():
+            self.video_widget.show()
+        self._bind_output()
+
+
+def create_media_backend(backend_key: str, parent: QWidget, path: Path) -> MediaBackendBase:
+    if backend_key == "vlc":
+        try:
+            return VlcMediaBackend(parent, path)
+        except Exception as exc:
+            backend = QtMediaBackend(parent, path)
+            QTimer.singleShot(0, lambda: backend.errorOccurred.emit(f"VLC 后端不可用，已回退系统模式: {exc}"))
+            return backend
+    return QtMediaBackend(parent, path)
 
 
 class OverlayRoundButton(QWidget):
@@ -417,6 +934,7 @@ class VideoTile(QFrame):
         self.group = group
         self.item = item
         self.index = index
+        self.playback_backend = group.playback_backend
         self._is_paused = False
         self._is_muted = True
         self._volume = 0
@@ -434,9 +952,14 @@ class VideoTile(QFrame):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(0)
 
-        self.video_widget = QVideoWidget(self)
-        self.video_widget.setAspectRatioMode(Qt.KeepAspectRatio)
+        self.backend = create_media_backend(self.playback_backend, self, item.path)
+        self.video_widget = self.backend.video_widget
+        self.video_widget.installEventFilter(self)
         layout.addWidget(self.video_widget, 1)
+        actual_backend = getattr(self.backend, "backend_key", self.playback_backend)
+        if actual_backend in PLAYBACK_BACKENDS and actual_backend != self.playback_backend:
+            self.playback_backend = actual_backend
+            self.group.playback_backend = actual_backend
 
         self.progress_slider = OverlayLineSlider()
         self.progress_slider.setRange(0, 0)
@@ -460,22 +983,15 @@ class VideoTile(QFrame):
             widget.hide()
             widget.raise_()
 
-        self.playlist = QMediaPlaylist(self)
-        self.playlist.addMedia(QMediaContent(QUrl.fromLocalFile(str(item.path))))
-        self.playlist.setPlaybackMode(QMediaPlaylist.Loop)
-        self.player = QMediaPlayer(self, QMediaPlayer.VideoSurface)
-        self.player.setPlaylist(self.playlist)
-        self.player.setVideoOutput(self.video_widget)
-        self.player.setMuted(True)
-        self.player.setVolume(0)
-        self.player.error.connect(self.on_player_error)
-        self.player.positionChanged.connect(self._sync_position)
-        self.player.durationChanged.connect(self._sync_duration)
-        self.player.play()
+        self.backend.errorOccurred.connect(self.on_player_error)
+        self.backend.positionChanged.connect(self._sync_position)
+        self.backend.durationChanged.connect(self._sync_duration)
+        self._pending_restore_position: Optional[int] = None
         self.set_selected(False)
 
-    def on_player_error(self, *_args) -> None:
-        self.setToolTip(f"{self.item.path.name} [播放失败]")
+    def on_player_error(self, message: str = "") -> None:
+        suffix = f" [播放失败: {message}]" if message else " [播放失败]"
+        self.setToolTip(f"{self.item.path.name}{suffix}")
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", selected)
@@ -485,6 +1001,7 @@ class VideoTile(QFrame):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self.backend.rebind_output()
         self._layout_overlay_controls()
 
     def _layout_overlay_controls(self) -> None:
@@ -572,31 +1089,77 @@ class VideoTile(QFrame):
     def mouseReleaseEvent(self, event) -> None:
         if self._dragging:
             self.group.finish_tile_drag(self.index)
+        self.group.handle_tile_release(self.index, self._dragging)
         self._drag_start_pos = None
         self._dragging = False
         super().mouseReleaseEvent(event)
 
     def contextMenuEvent(self, event) -> None:
-        self.group.show_tile_menu(self.index, event.globalPos())
+        self.group.show_tile_menu(self.index, QCursor.pos())
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.video_widget:
+            if event.type() == QEvent.Enter:
+                self.enterEvent(event)
+                return False
+            if event.type() == QEvent.Leave:
+                self.leaveEvent(event)
+                return False
+            if event.type() == QEvent.ContextMenu:
+                self.group.show_tile_menu(self.index, event.globalPos())
+                return True
+            if event.type() == QEvent.MouseButtonPress:
+                local_pos = self.mapFromGlobal(event.globalPos())
+                self._handle_mouse_press(local_pos, event)
+                return True
+            if event.type() == QEvent.MouseMove:
+                local_pos = self.mapFromGlobal(event.globalPos())
+                self._handle_mouse_move(local_pos, event)
+                return True
+            if event.type() == QEvent.MouseButtonRelease:
+                self._handle_mouse_release(event)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _handle_mouse_press(self, local_pos: QPoint, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = local_pos
+            self._dragging = False
+        self.group.handle_tile_press(self.index, event)
+
+    def _handle_mouse_move(self, local_pos: QPoint, event) -> None:
+        if event.buttons() & Qt.LeftButton and self._drag_start_pos is not None:
+            if not self._dragging and (local_pos - self._drag_start_pos).manhattanLength() >= 10:
+                self._dragging = True
+            if self._dragging:
+                center = self.mapTo(self.group.content, local_pos)
+                self.group.handle_tile_drag(self.index, center)
+
+    def _handle_mouse_release(self, event) -> None:
+        if self._dragging:
+            self.group.finish_tile_drag(self.index)
+        self.group.handle_tile_release(self.index, self._dragging)
+        self._drag_start_pos = None
+        self._dragging = False
 
     def toggle_pause(self) -> None:
         self._is_paused = not self._is_paused
         self.play_btn.set_icon_kind("play" if self._is_paused else "pause")
         if self._is_paused:
-            self.player.pause()
+            self.backend.pause()
         else:
-            self.player.play()
+            self.backend.play()
 
     def toggle_mute(self) -> None:
         self._is_muted = not self._is_muted
-        self.player.setMuted(self._is_muted)
-        self.player.setVolume(0 if self._is_muted else self._volume)
+        self.backend.set_muted(self._is_muted)
+        self.backend.set_volume(0 if self._is_muted else self._volume)
         self._update_volume_icon()
 
     def change_volume(self, value: int) -> None:
         self._volume = max(0, min(100, int(value)))
         if not self._is_muted:
-            self.player.setVolume(self._volume)
+            self.backend.set_volume(self._volume)
         self._update_volume_icon()
 
     def _update_volume_icon(self) -> None:
@@ -612,20 +1175,71 @@ class VideoTile(QFrame):
     def _sync_duration(self, duration: int) -> None:
         self._duration_ms = max(0, int(duration))
         self.progress_slider.setRange(0, self._duration_ms)
+        if self._pending_restore_position is not None and self._duration_ms > 0:
+            self.backend.set_position(max(0, min(self._pending_restore_position, self._duration_ms)))
+            self._pending_restore_position = None
 
     def _on_seek_pressed(self) -> None:
         self._seeking = True
 
     def _on_seek_moved(self, value: int) -> None:
         self._seeking = True
-        self.player.setPosition(max(0, int(value)))
+        self.backend.set_position(max(0, int(value)))
 
     def _on_seek_released(self) -> None:
-        self.player.setPosition(max(0, int(self.progress_slider.value())))
+        self.backend.set_position(max(0, int(self.progress_slider.value())))
         self._seeking = False
 
+    def restart_playback(self) -> None:
+        self._is_paused = False
+        self.play_btn.set_icon_kind("pause")
+        self.backend.restart_playback()
+
+    def snapshot_state(self) -> dict:
+        return {
+            "position": max(0, int(self.backend.position())),
+            "paused": bool(self._is_paused),
+            "muted": bool(self._is_muted),
+            "volume": int(self._volume),
+        }
+
+    def restore_state(self, state: Optional[dict]) -> None:
+        if not state:
+            return
+        self._volume = max(0, min(100, int(state.get("volume", 0))))
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(self._volume)
+        self.volume_slider.blockSignals(False)
+        self._is_muted = bool(state.get("muted", True))
+        self.backend.set_muted(self._is_muted)
+        self.backend.set_volume(0 if self._is_muted else self._volume)
+        self._update_volume_icon()
+        self._is_paused = bool(state.get("paused", False))
+        self.play_btn.set_icon_kind("play" if self._is_paused else "pause")
+        pos = max(0, int(state.get("position", 0)))
+        if self._duration_ms > 0:
+            self.backend.set_position(min(pos, self._duration_ms))
+        else:
+            self._pending_restore_position = pos
+        if self._is_paused:
+            self.backend.pause()
+        else:
+            self.backend.play()
+
     def stop(self) -> None:
-        self.player.stop()
+        try:
+            self.backend.errorOccurred.disconnect(self.on_player_error)
+        except Exception:
+            pass
+        try:
+            self.backend.positionChanged.disconnect(self._sync_position)
+        except Exception:
+            pass
+        try:
+            self.backend.durationChanged.disconnect(self._sync_duration)
+        except Exception:
+            pass
+        self.backend.stop()
         self.play_btn.hide()
         self.mute_btn.hide()
         self.progress_slider.hide()
@@ -637,7 +1251,7 @@ class VideoTile(QFrame):
 
 
 class GroupWindow(QWidget):
-    def __init__(self, app: "VideoReadApp", group_id: int, name: str, rows: int, smart_layout: bool, layout_algorithm: str = "grid") -> None:
+    def __init__(self, app: "VideoReadApp", group_id: int, name: str, rows: int, smart_layout: bool, layout_algorithm: str = "grid", playback_backend: str = "qt") -> None:
         super().__init__(None)
         self.app = app
         self.group_id = group_id
@@ -645,14 +1259,21 @@ class GroupWindow(QWidget):
         self.rows = max(1, rows)
         self.smart_layout = smart_layout
         self.layout_algorithm = layout_algorithm if layout_algorithm in LAYOUT_ALGOS else "grid"
+        self.playback_backend = playback_backend if playback_backend in PLAYBACK_BACKENDS else "qt"
         self.template_path: Optional[Path] = None
         self.items: list[VideoItem] = []
         self.tiles: list[VideoTile] = []
         self.selected_indexes: set[int] = set()
         self._drag_source_index: Optional[int] = None
+        self._press_toggle_candidate: Optional[int] = None
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._render_from_timer)
+        self._screen_fix_timer = QTimer(self)
+        self._screen_fix_timer.setSingleShot(True)
+        self._screen_fix_timer.timeout.connect(self._force_screen_rebuild)
+        self._screen_signal_bound = False
+        self._screen_signature: Optional[tuple[str, int, int, int, int, float]] = None
 
         self.setWindowTitle(name)
         apply_window_icon(self)
@@ -674,6 +1295,8 @@ class GroupWindow(QWidget):
     def closeEvent(self, event) -> None:
         if self._render_timer.isActive():
             self._render_timer.stop()
+        if self._screen_fix_timer.isActive():
+            self._screen_fix_timer.stop()
         for tile in self.tiles:
             tile.stop()
             tile.setParent(None)
@@ -682,10 +1305,20 @@ class GroupWindow(QWidget):
         self.app.unregister_group(self.group_id)
         super().closeEvent(event)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.placeholder.setGeometry(self.content.rect())
+        self._bind_screen_events()
+        self._maybe_handle_screen_change()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.placeholder.setGeometry(self.content.rect())
         self.schedule_render()
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        self._maybe_handle_screen_change()
 
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasUrls():
@@ -720,14 +1353,24 @@ class GroupWindow(QWidget):
 
     def handle_tile_press(self, index: int, event) -> None:
         self.app.set_active_group(self.group_id)
+        self._press_toggle_candidate = None
         if event.modifiers() & Qt.ControlModifier:
             if index in self.selected_indexes:
                 self.selected_indexes.remove(index)
             else:
                 self.selected_indexes.add(index)
         else:
-            self.selected_indexes = {index}
+            if index in self.selected_indexes and len(self.selected_indexes) == 1:
+                self._press_toggle_candidate = index
+            else:
+                self.selected_indexes = {index}
         self.refresh_selection()
+
+    def handle_tile_release(self, index: int, dragged: bool) -> None:
+        if not dragged and self._press_toggle_candidate == index and index in self.selected_indexes:
+            self.selected_indexes.clear()
+            self.refresh_selection()
+        self._press_toggle_candidate = None
 
     def handle_tile_drag(self, index: int, point: QPoint) -> None:
         if not (0 <= index < len(self.tiles)):
@@ -773,6 +1416,7 @@ class GroupWindow(QWidget):
         menu = QMenu(self)
         label = "从窗口组移除所选视频" if len(self.selected_indexes) > 1 else "从窗口组移除视频"
         menu.addAction(label, self.remove_selected)
+        menu.addAction("全部重新开始播放", self.restart_all_playback)
         menu.addSeparator()
         algo_menu = menu.addMenu("重排算法")
         algo_menu.addAction("使用算法1重排", lambda: self.apply_algorithm("grid"))
@@ -784,14 +1428,19 @@ class GroupWindow(QWidget):
         menu.exec_(global_pos)
 
     def contextMenuEvent(self, event) -> None:
-        self.show_window_menu(event.globalPos())
+        self.show_window_menu(QCursor.pos())
 
     def show_window_menu(self, global_pos: QPoint) -> None:
         menu = QMenu(self)
+        if self.selected_indexes:
+            label = "从窗口组移除所选视频" if len(self.selected_indexes) > 1 else "从窗口组移除视频"
+            menu.addAction(label, self.remove_selected)
+            menu.addSeparator()
+        menu.addAction("全部重新开始播放", self.restart_all_playback)
+        menu.addSeparator()
         algo_menu = menu.addMenu("重排算法")
         algo_menu.addAction("使用算法1重排", lambda: self.apply_algorithm("grid"))
         algo_menu.addAction("使用算法2重排", lambda: self.apply_algorithm("justified"))
-        menu.addSeparator()
         menu.addAction("保存为模板", lambda: self.app.save_group_template(self))
         if self.template_path:
             menu.addAction("更新该模板", lambda: self.app.update_linked_template(self))
@@ -802,18 +1451,21 @@ class GroupWindow(QWidget):
         for idx, tile in enumerate(self.tiles):
             tile.set_selected(idx in self.selected_indexes)
 
-    def set_layout(self, rows: int, smart_layout: bool, layout_algorithm: str) -> None:
+    def set_layout(self, rows: int, smart_layout: bool, layout_algorithm: str, playback_backend: Optional[str] = None) -> None:
         self.rows = max(1, rows)
         self.smart_layout = smart_layout
         self.layout_algorithm = layout_algorithm if layout_algorithm in LAYOUT_ALGOS else "grid"
+        if playback_backend and playback_backend in PLAYBACK_BACKENDS:
+            self.playback_backend = playback_backend
         self.app.mark_dirty()
-        self.render()
+        self.render(force_rebuild=bool(playback_backend))
 
     def apply_algorithm(self, layout_algorithm: str) -> None:
         self.layout_algorithm = layout_algorithm if layout_algorithm in LAYOUT_ALGOS else self.layout_algorithm
         self.app.mark_dirty()
         self.app.set_active_group(self.group_id)
-        self.app.algo_combo.setCurrentText("算法2 (justified)" if self.layout_algorithm == "justified" else "算法1 (grid)")
+        self.app.algo_combo.setCurrentText("算法2 (justified)" if self.layout_algorithm == "justified" else "算法1 (smart)")
+        self.app.backend_combo.setCurrentText(playback_backend_label(self.playback_backend))
         self.app.refresh_group_list(select_gid=self.group_id)
         self.render()
 
@@ -821,6 +1473,55 @@ class GroupWindow(QWidget):
         if self._render_timer.isActive():
             self._render_timer.stop()
         self._render_timer.start(delay_ms)
+
+    def _bind_screen_events(self) -> None:
+        handle = self.windowHandle()
+        if handle is None or self._screen_signal_bound:
+            return
+        handle.screenChanged.connect(self._on_screen_changed)
+        self._screen_signal_bound = True
+        self._screen_signature = self._current_screen_signature()
+
+    def _current_screen_signature(self) -> Optional[tuple[str, int, int, int, int, float]]:
+        handle = self.windowHandle()
+        screen = handle.screen() if handle is not None else QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen is None:
+            return None
+        geo = screen.availableGeometry()
+        return (
+            screen.name(),
+            geo.x(),
+            geo.y(),
+            geo.width(),
+            geo.height(),
+            float(screen.devicePixelRatio()),
+        )
+
+    def _maybe_handle_screen_change(self) -> None:
+        self._bind_screen_events()
+        signature = self._current_screen_signature()
+        if signature is None:
+            return
+        if signature != self._screen_signature:
+            self._screen_signature = signature
+            self._after_screen_changed()
+
+    def _on_screen_changed(self, _screen) -> None:
+        self._screen_signature = self._current_screen_signature()
+        self._after_screen_changed()
+
+    def _after_screen_changed(self) -> None:
+        self.placeholder.setGeometry(self.content.rect())
+        self.content.updateGeometry()
+        self.updateGeometry()
+        self._render_timer.stop()
+        self._screen_fix_timer.stop()
+        self.schedule_render(0)
+        QTimer.singleShot(120, self._render_from_timer)
+        self._screen_fix_timer.start(260)
+
+    def _force_screen_rebuild(self) -> None:
+        self.render(force_rebuild=True)
 
     def _render_from_timer(self) -> None:
         self.render()
@@ -831,6 +1532,7 @@ class GroupWindow(QWidget):
             "rows": self.rows,
             "smart_layout": self.smart_layout,
             "layout_algorithm": self.layout_algorithm,
+            "playback_backend": self.playback_backend,
             "template_path": str(self.template_path) if self.template_path else "",
             "geometry": geometry_string(self),
             "videos": [str(item.path) for item in self.items],
@@ -854,17 +1556,38 @@ class GroupWindow(QWidget):
         self.app.refresh_group_list(select_gid=self.group_id)
         self.app.update_status()
 
+    def clear_videos(self) -> None:
+        for tile in self.tiles:
+            tile.stop()
+            tile.setParent(None)
+            tile.deleteLater()
+        self.items.clear()
+        self.tiles.clear()
+        self.selected_indexes.clear()
+        self._press_toggle_candidate = None
+        self._drag_source_index = None
+
     def remove_selected(self) -> None:
         if not self.selected_indexes:
             return
         for idx in sorted(self.selected_indexes, reverse=True):
             if 0 <= idx < len(self.items):
                 self.items.pop(idx)
+            if 0 <= idx < len(self.tiles):
+                tile = self.tiles.pop(idx)
+                tile.stop()
+                tile.setParent(None)
+                tile.deleteLater()
         self.selected_indexes.clear()
+        self._press_toggle_candidate = None
         self.app.mark_dirty()
-        self.render(force_rebuild=True)
+        self.render(force_rebuild=False)
         self.app.refresh_group_list(select_gid=self.group_id)
         self.app.update_status()
+
+    def restart_all_playback(self) -> None:
+        for tile in self.tiles:
+            tile.restart_playback()
 
     def _aspect_ratios(self) -> list[float]:
         return [max(0.05, item.width / max(1, item.height)) for item in self.items]
@@ -1108,44 +1831,22 @@ class GroupWindow(QWidget):
         return rects[:count]
 
     def _grid_layout_rects(self, total_w: int, total_h: int) -> list[tuple[int, int, int, int]]:
-        count = len(self.items)
-        if count <= 0:
-            return []
-        rows = self.rows
-        if self.smart_layout and count > 0:
-            best_rows = 1
-            best_score = -1.0
-            max_rows = min(count, 12)
-            for candidate_rows in range(1, max_rows + 1):
-                cols = max(1, math.ceil(count / candidate_rows))
-                cell_w = max(1, total_w // cols)
-                cell_h = max(1, total_h // candidate_rows)
-                used_area = 0.0
-                for item in self.items:
-                    scale = min(cell_w / max(1, item.width), cell_h / max(1, item.height))
-                    used_area += item.width * item.height * (scale * scale)
-                holes = candidate_rows * cols - count
-                score = (used_area / max(1.0, total_w * total_h)) - holes * 0.015
-                if score > best_score:
-                    best_score = score
-                    best_rows = candidate_rows
-            rows = best_rows
-        cols = max(1, math.ceil(count / rows))
-        cell_w = max(1, total_w // cols)
-        cell_h = max(1, total_h // rows)
-        rects: list[tuple[int, int, int, int]] = []
-        for idx in range(count):
-            row = idx // cols
-            col = idx % cols
-            x0 = col * cell_w
-            y0 = row * cell_h
-            x1 = total_w if col == cols - 1 else x0 + cell_w
-            y1 = total_h if row == rows - 1 else y0 + cell_h
-            rects.append((x0, y0, x1, y1))
-        return rects
+        # Keep the persisted "grid" key for template/session compatibility,
+        # but use PicRead-style smart packing so algorithm1 respects aspect
+        # ratios and uses space more naturally.
+        return self._smart_layout_rects(total_w, total_h)
 
     def _simple_fallback_rects(self, total_w: int, total_h: int) -> list[tuple[int, int, int, int]]:
         return self._smart_layout_rects(total_w, total_h)
+
+    def _snapshot_tile_states(self) -> dict[str, list[dict]]:
+        state_map: dict[str, list[dict]] = {}
+        for idx, tile in enumerate(self.tiles):
+            if idx >= len(self.items):
+                continue
+            key = str(self.items[idx].path.resolve())
+            state_map.setdefault(key, []).append(tile.snapshot_state())
+        return state_map
 
     def render(self, force_rebuild: bool = False) -> None:
         total_w = max(1, self.content.width())
@@ -1161,6 +1862,7 @@ class GroupWindow(QWidget):
                 self.tiles = []
             return
         self.placeholder.hide()
+        preserved_states = self._snapshot_tile_states() if force_rebuild else {}
         if force_rebuild:
             for tile in self.tiles:
                 tile.stop()
@@ -1187,6 +1889,11 @@ class GroupWindow(QWidget):
             tile.index = idx
             x0, y0, x1, y1 = rects[idx]
             tile.setGeometry(QRect(x0, y0, max(1, x1 - x0), max(1, y1 - y0)))
+            if force_rebuild:
+                key = str(self.items[idx].path.resolve())
+                states = preserved_states.get(key)
+                if states:
+                    tile.restore_state(states.pop(0))
             tile.show()
         self.refresh_selection()
 
@@ -1214,7 +1921,7 @@ class VideoReadApp(QMainWindow):
         self.update_status()
 
     def _apply_dark_theme(self) -> None:
-        self.setWindowTitle("VideoRead - 多窗口组平铺播片")
+        self.setWindowTitle(f"VideoRead v{APP_VERSION} - 多窗口组平铺播片")
         palette = QPalette()
         palette.setColor(QPalette.Window, QColor("#1e1e1e"))
         palette.setColor(QPalette.WindowText, QColor("#d4d4d4"))
@@ -1260,7 +1967,7 @@ class VideoReadApp(QMainWindow):
         outer = QVBoxLayout(root)
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
-        title = QLabel("VideoRead | 多窗口组平铺播片", root)
+        title = QLabel(f"VideoRead v{APP_VERSION} | 多窗口组平铺播片", root)
         title.setObjectName("title")
         outer.addWidget(title)
 
@@ -1279,8 +1986,11 @@ class VideoReadApp(QMainWindow):
         self.smart_check = QCheckBox("智能排版")
         self.smart_check.setChecked(True)
         self.algo_combo = QComboBox()
-        self.algo_combo.addItems(["算法1 (grid)", "算法2 (justified)"])
+        self.algo_combo.addItems(["算法1 (smart)", "算法2 (justified)"])
         self.algo_combo.setFixedWidth(148)
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItems([playback_backend_label("qt"), playback_backend_label("vlc")])
+        self.backend_combo.setFixedWidth(166)
         create_btn = QPushButton("创建窗口组")
         create_btn.clicked.connect(self.create_group)
         control.addWidget(QLabel("窗口组名:"))
@@ -1290,6 +2000,8 @@ class VideoReadApp(QMainWindow):
         control.addWidget(self.smart_check)
         control.addWidget(QLabel("算法:"))
         control.addWidget(self.algo_combo)
+        control.addWidget(QLabel("播放后端:"))
+        control.addWidget(self.backend_combo)
         control.addWidget(create_btn)
         group_layout.addLayout(control)
 
@@ -1359,6 +2071,9 @@ class VideoReadApp(QMainWindow):
     def current_layout_algo(self) -> str:
         return "justified" if "justified" in self.algo_combo.currentText() else "grid"
 
+    def current_playback_backend(self) -> str:
+        return playback_backend_from_label(self.backend_combo.currentText())
+
     def mark_dirty(self) -> None:
         self.dirty = True
 
@@ -1420,7 +2135,11 @@ class VideoReadApp(QMainWindow):
         gid = self.next_group_id
         self.next_group_id += 1
         name = self.group_name_edit.text().strip() or f"视频窗口组{gid}"
-        group = GroupWindow(self, gid, name, int(self.rows_spin.value()), self.smart_check.isChecked(), self.current_layout_algo())
+        backend = self.resolve_backend_choice(self.current_playback_backend(), parent=self, fallback_to_qt=False)
+        if backend is None:
+            self.next_group_id -= 1
+            return
+        group = GroupWindow(self, gid, name, int(self.rows_spin.value()), self.smart_check.isChecked(), self.current_layout_algo(), playback_backend=backend)
         self.groups[gid] = group
         self.group_order.append(gid)
         group.show()
@@ -1438,7 +2157,8 @@ class VideoReadApp(QMainWindow):
             if group is None:
                 continue
             algo = f" | algo={LAYOUT_ALGOS.get(group.layout_algorithm, '算法1')}" if group.smart_layout else ""
-            item = QListWidgetItem(f"{group.name} | rows={group.rows} | {len(group.items)} videos{algo}")
+            backend = f" | {group.playback_backend.upper()}"
+            item = QListWidgetItem(f"{group.name} | rows={group.rows} | {len(group.items)} videos{algo}{backend}")
             item.setData(Qt.UserRole, gid)
             self.group_list.addItem(item)
             if select_gid == gid or (select_gid is None and self.active_group_id == gid):
@@ -1446,6 +2166,43 @@ class VideoReadApp(QMainWindow):
         self.group_list.blockSignals(False)
         if self.group_list.currentRow() >= 0:
             self.on_group_selected()
+
+    def dialog_parent(self, target_group: Optional[GroupWindow] = None) -> QWidget:
+        if target_group is not None:
+            try:
+                if target_group.isVisible():
+                    return target_group
+            except Exception:
+                pass
+        return self
+
+    def prepare_dialog(self, dialog: QDialog, parent: QWidget) -> None:
+        dialog.setParent(parent, dialog.windowFlags())
+        dialog.setWindowModality(Qt.WindowModal)
+        QTimer.singleShot(0, dialog.raise_)
+        QTimer.singleShot(0, dialog.activateWindow)
+
+    def show_info(self, parent: QWidget, title: str, text: str) -> None:
+        QMessageBox.information(parent, title, text)
+
+    def show_error(self, parent: QWidget, title: str, text: str) -> None:
+        QMessageBox.critical(parent, title, text)
+
+    def ask_yes_no(self, parent: QWidget, title: str, text: str) -> bool:
+        return QMessageBox.question(parent, title, text) == QMessageBox.Yes
+
+    def resolve_backend_choice(self, backend: str, parent: Optional[QWidget] = None, fallback_to_qt: bool = True) -> Optional[str]:
+        backend = backend if backend in PLAYBACK_BACKENDS else "qt"
+        if backend != "vlc":
+            return "qt"
+        if is_vlc_runtime_available():
+            return "vlc"
+        target_parent = parent or self
+        if fallback_to_qt:
+            self.show_info(target_parent, "提示", "当前未检测到可用的 VLC 运行库，将自动回退到系统模式。")
+            return "qt"
+        self.show_info(target_parent, "提示", "当前未检测到可用的 VLC 运行库，请先安装 VLC 或切换回系统模式。")
+        return None
 
     def selected_group(self) -> Optional[GroupWindow]:
         item = self.group_list.currentItem()
@@ -1473,7 +2230,8 @@ class VideoReadApp(QMainWindow):
         self.group_name_edit.setText(group.name)
         self.rows_spin.setValue(group.rows)
         self.smart_check.setChecked(group.smart_layout)
-        self.algo_combo.setCurrentText("算法2 (justified)" if group.layout_algorithm == "justified" else "算法1 (grid)")
+        self.algo_combo.setCurrentText("算法2 (justified)" if group.layout_algorithm == "justified" else "算法1 (smart)")
+        self.backend_combo.setCurrentText(playback_backend_label(group.playback_backend))
 
     def add_videos(self) -> None:
         group = self.selected_group()
@@ -1492,7 +2250,12 @@ class VideoReadApp(QMainWindow):
             return
         group.name = self.group_name_edit.text().strip() or group.name
         group.setWindowTitle(group.name)
-        group.set_layout(int(self.rows_spin.value()), self.smart_check.isChecked(), self.current_layout_algo())
+        requested_backend = self.resolve_backend_choice(self.current_playback_backend(), parent=group, fallback_to_qt=False)
+        if requested_backend is None:
+            self.backend_combo.setCurrentText(playback_backend_label(group.playback_backend))
+            return
+        rebuild_backend = requested_backend if requested_backend != group.playback_backend else None
+        group.set_layout(int(self.rows_spin.value()), self.smart_check.isChecked(), self.current_layout_algo(), playback_backend=rebuild_backend)
         self.mark_dirty()
         self.refresh_group_list(select_gid=group.group_id)
 
@@ -1513,8 +2276,9 @@ class VideoReadApp(QMainWindow):
 
     def save_group_template(self, target_group: Optional[GroupWindow] = None) -> None:
         group = target_group or self.selected_group()
+        parent = self.dialog_parent(group)
         if group is None:
-            QMessageBox.information(self, "提示", "请先选择一个窗口组。")
+            self.show_info(parent, "提示", "请先选择一个窗口组。")
             return
         current_category = ""
         if group.template_path and group.template_path.exists():
@@ -1522,7 +2286,8 @@ class VideoReadApp(QMainWindow):
                 current_category = str(json.loads(group.template_path.read_text(encoding="utf-8")).get("category", "")).strip()
             except Exception:
                 current_category = ""
-        dialog = TemplateInfoDialog(self, group.name, current_category)
+        dialog = TemplateInfoDialog(parent, group.name, current_category)
+        self.prepare_dialog(dialog, parent)
         if dialog.exec_() != QDialog.Accepted:
             return
         name, category = dialog.values()
@@ -1538,11 +2303,12 @@ class VideoReadApp(QMainWindow):
 
     def update_linked_template(self, target_group: Optional[GroupWindow] = None) -> None:
         group = target_group or self.selected_group()
+        parent = self.dialog_parent(group)
         if group is None:
-            QMessageBox.information(self, "提示", "请先选择一个窗口组。")
+            self.show_info(parent, "提示", "请先选择一个窗口组。")
             return
         if not group.template_path:
-            QMessageBox.information(self, "提示", "当前组没有关联模板，请先保存为模板。")
+            self.show_info(parent, "提示", "当前组没有关联模板，请先保存为模板。")
             return
         data = group.to_state()
         old = {}
@@ -1553,16 +2319,20 @@ class VideoReadApp(QMainWindow):
             old = {}
         data["template_name"] = str(old.get("template_name", group.name)).strip() or group.name
         data["category"] = str(old.get("category", "")).strip()
-        group.template_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.refresh_template_library()
+        try:
+            group.template_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.refresh_template_library()
+        except Exception as exc:
+            self.show_error(parent, "更新失败", str(exc))
 
     def reload_linked_template(self, target_group: Optional[GroupWindow] = None) -> None:
         group = target_group or self.selected_group()
+        parent = self.dialog_parent(group)
         if group is None:
-            QMessageBox.information(self, "提示", "请先选择一个窗口组。")
+            self.show_info(parent, "提示", "请先选择一个窗口组。")
             return
         if not group.template_path or not group.template_path.exists():
-            QMessageBox.information(self, "提示", "当前组没有可用的关联模板。")
+            self.show_info(parent, "提示", "当前组没有可用的关联模板。")
             return
         data = json.loads(group.template_path.read_text(encoding="utf-8"))
         group.name = str(data.get("template_name", data.get("name", group.name))).strip() or group.name
@@ -1570,7 +2340,7 @@ class VideoReadApp(QMainWindow):
         group.rows = max(1, int(data.get("rows", group.rows)))
         group.smart_layout = bool(data.get("smart_layout", group.smart_layout))
         group.layout_algorithm = str(data.get("layout_algorithm", group.layout_algorithm)).strip() or group.layout_algorithm
-        group.items = []
+        group.clear_videos()
         video_paths = [Path(p) for p in data.get("videos", []) if Path(p).is_file()]
         group.add_paths(video_paths)
         geo = str(data.get("geometry", "")).strip()
@@ -1587,9 +2357,10 @@ class VideoReadApp(QMainWindow):
                 name = str(data.get("template_name", path.stem)).strip() or path.stem
                 count = len(data.get("videos", []))
                 algo = LAYOUT_ALGOS.get(str(data.get("layout_algorithm", "grid")), "算法1")
+                backend = str(data.get("playback_backend", "qt")).strip() or "qt"
                 category = str(data.get("category", "")).strip()
                 extra = f" | {category}" if category else ""
-                self.template_list.addItem(f"{name} | {count} videos | {algo}{extra}")
+                self.template_list.addItem(f"{name} | {count} videos | {algo} | {backend.upper()}{extra}")
                 self.template_entries.append(path)
             except Exception:
                 continue
@@ -1603,13 +2374,17 @@ class VideoReadApp(QMainWindow):
     def load_group_template(self) -> None:
         path = self.selected_template_path()
         if path is None:
-            QMessageBox.information(self, "提示", "请先在模板库里选择一个模板。")
+            self.show_info(self, "提示", "请先在模板库里选择一个模板。")
             return
         data = json.loads(path.read_text(encoding="utf-8"))
         gid = self.next_group_id
         self.next_group_id += 1
         name = str(data.get("template_name", path.stem)).strip() or path.stem
-        group = GroupWindow(self, gid, name, max(1, int(data.get("rows", 2))), bool(data.get("smart_layout", True)), str(data.get("layout_algorithm", "grid")).strip() or "grid")
+        backend = self.resolve_backend_choice(self.current_playback_backend(), parent=self, fallback_to_qt=False)
+        if backend is None:
+            self.next_group_id -= 1
+            return
+        group = GroupWindow(self, gid, name, max(1, int(data.get("rows", 2))), bool(data.get("smart_layout", True)), str(data.get("layout_algorithm", "grid")).strip() or "grid", playback_backend=backend)
         group.template_path = path
         self.groups[gid] = group
         self.group_order.append(gid)
@@ -1627,21 +2402,21 @@ class VideoReadApp(QMainWindow):
     def delete_selected_template(self) -> None:
         path = self.selected_template_path()
         if path is None:
-            QMessageBox.information(self, "提示", "请先在模板库里选择一个模板。")
+            self.show_info(self, "提示", "请先在模板库里选择一个模板。")
             return
-        reply = QMessageBox.question(self, "删除模板", f"确定删除模板 {path.stem} 吗？\n\n不会删除原始视频文件。")
-        if reply != QMessageBox.Yes:
+        if not self.ask_yes_no(self, "删除模板", f"确定删除模板 {path.stem} 吗？\n\n不会删除原始视频文件。"):
             return
         try:
             path.unlink(missing_ok=True)
         except Exception as exc:
-            QMessageBox.critical(self, "删除失败", str(exc))
+            self.show_error(self, "删除失败", str(exc))
             return
         self.refresh_template_library()
 
     def session_payload(self) -> dict:
         return {
             "version": 1,
+            "app_version": APP_VERSION,
             "saved_at": int(time.time()),
             "groups": [self.groups[gid].to_state() for gid in self.group_order if gid in self.groups],
         }
@@ -1712,7 +2487,8 @@ class VideoReadApp(QMainWindow):
             gid = self.next_group_id
             self.next_group_id += 1
             name = str(item.get("name", f"视频窗口组{gid}")).strip() or f"视频窗口组{gid}"
-            group = GroupWindow(self, gid, name, max(1, int(item.get("rows", 2))), bool(item.get("smart_layout", True)), str(item.get("layout_algorithm", "grid")).strip() or "grid")
+            backend = self.resolve_backend_choice(str(item.get("playback_backend", "qt")).strip() or "qt", parent=self, fallback_to_qt=True) or "qt"
+            group = GroupWindow(self, gid, name, max(1, int(item.get("rows", 2))), bool(item.get("smart_layout", True)), str(item.get("layout_algorithm", "grid")).strip() or "grid", playback_backend=backend)
             template_path = str(item.get("template_path", "")).strip()
             if template_path:
                 group.template_path = Path(template_path)
@@ -1733,7 +2509,11 @@ class VideoReadApp(QMainWindow):
         total_groups = len(self.groups)
         total_videos = sum(len(group.items) for group in self.groups.values())
         known_ratio = sum(1 for group in self.groups.values() for item in group.items if item.width > 1 and item.height > 1)
-        self.status_label.setText(f"播放:PyQt5 QMediaPlayer | 拖拽:开 | 窗口组:{total_groups} | 视频:{total_videos} | 已识别比例:{known_ratio}")
+        qt_groups = sum(1 for group in self.groups.values() if group.playback_backend == "qt")
+        vlc_groups = sum(1 for group in self.groups.values() if group.playback_backend == "vlc")
+        self.status_label.setText(
+            f"播放后端: Qt={qt_groups} / VLC={vlc_groups} | 拖拽:开 | 窗口组:{total_groups} | 视频:{total_videos} | 已识别比例:{known_ratio}"
+        )
 
     def tick(self) -> None:
         self.update_status()
